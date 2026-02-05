@@ -17,250 +17,302 @@ These need to be split into separate files for proper organization and review.
 
 ---
 
-## The Key Insight
+## Three Detection Methods
 
-Legal documents typically include **internal page numbering** in the format:
+The algorithm uses **three independent methods** to detect document boundaries. If any method detects a boundary, the split occurs.
 
+### Method 1: "Page X of Y" Pattern
+
+**How it works:** Legal documents often include "Page 1 of 5", "Page 2 of 5", etc. When we find a page where X equals Y (e.g., "Page 5 of 5"), we know we've reached the **last page** of that document.
+
+**Patterns detected:**
 ```
-Page 1 of 5
-Page 2 of 5
-...
-Page 5 of 5    ← This marks the END of Document 1
-Page 1 of 3    ← This starts Document 2
-Page 2 of 3
-Page 3 of 3    ← This marks the END of Document 2
+PAGE 3 OF 5
+Page 3 of 5
+PA GE 3 OF 5    (handles OCR errors)
+3 of 5 pages
 ```
 
-**The algorithm detects document boundaries by finding pages where `current_page == total_pages`** (e.g., "Page 5 of 5"). When this condition is true, we know we've reached the last page of a document.
+**Boundary condition:** `current_page == total_pages`
+
+**Example:**
+```
+PDF Page:  1    2    3    4    5    6    7    8
+Content:   1/5  2/5  3/5  4/5  5/5  1/3  2/3  3/3
+                              ↑              ↑
+                          BOUNDARY       BOUNDARY
+```
+
+---
+
+### Method 2: Standalone Page Number Reset
+
+**How it works:** Some documents only show "Page 1", "Page 2", etc. (without "of Y"). When the page number **resets to 1** after being higher, a new document has started.
+
+**Patterns detected:**
+```
+PAGE 3
+Page 3
+- 3 -
+— 3 —
+```
+
+**Boundary condition:** `current_page == 1 AND previous_page > 1`
+
+**Example:**
+```
+PDF Page:  1    2    3    4    5    6    7
+Content:   1    2    3    4    1    2    3
+                         ↑
+                     BOUNDARY
+                (Page 4 → Page 1 = new document)
+```
+
+**Note:** The boundary is placed *before* Page 1, so Document 1 ends at PDF page 4, and Document 2 starts at PDF page 5.
+
+---
+
+### Method 3: Header Document Type Change
+
+**How it works:** Legal documents typically have a consistent header identifying the document type (e.g., "AFFIDAVIT" or "SEARCH WARRANT"). When this header **changes**, a new document has begun.
+
+**Document types tracked:**
+```
+SEARCH WARRANT, AFFIDAVIT, SUBPOENA, COURT ORDER,
+RETURN AND TABULATION, MOTION, DECLARATION, EXHIBIT,
+COMPLAINT, ANSWER, SUMMONS, PETITION, ORDER, WARRANT,
+NOTICE, CERTIFICATE
+```
+
+**Boundary condition:** `current_header_type != previous_header_type`
+
+**Example:**
+```
+PDF Page:  1          2          3          4          5
+Header:    AFFIDAVIT  AFFIDAVIT  AFFIDAVIT  WARRANT    WARRANT
+                                            ↑
+                                        BOUNDARY
+                        (AFFIDAVIT → WARRANT = new document)
+```
+
+---
+
+## No-OCR Page Detection
+
+**Problem:** Some PDF pages contain scanned images without OCR text, or the OCR failed. These pages have little or no extractable text.
+
+**How it works:** If a page has fewer than 50 characters of text, it's flagged as a "no-OCR" page.
+
+**Output behavior:** Documents containing no-OCR pages are prefixed with `No_OCR_` in the filename:
+```
+No_OCR_discovery_split_03_exhibit.pdf
+```
+
+This makes it easy to identify documents that may need:
+- Manual review
+- Re-scanning
+- OCR processing
 
 ---
 
 ## Algorithm Walkthrough
 
-### Phase 1: Text Extraction
-
-For each page in the PDF:
+### Step 1: Initialize State
 
 ```python
-page = pdf.pages[page_num]
-text = page.extract_text()
+current_start = 0          # PDF page where current document begins
+current_title = None       # Title of current document
+current_no_ocr_count = 0   # Pages with no OCR in current document
+prev_standalone_page = None # Previous standalone page number
+prev_header_type = None    # Previous document type header
 ```
 
-The `pdfplumber` library extracts all text content from the page. This is the slow part—scanned documents take longer because the library must process image-based text.
-
-### Phase 2: Pattern Matching
-
-The extracted text is searched for page numbering patterns:
-
-```python
-PAGE_PATTERNS = [
-    r'PAGE\s+(\d+)\s+OF\s+(\d+)',      # "PAGE 3 OF 5"
-    r'PA\s*[GE]+\s*(\d+)\s+OF\s*(\d+)', # Handles OCR errors like "PA GE 3 OF 5"
-    r'Page\s+(\d+)\s+of\s+(\d+)',      # "Page 3 of 5"
-]
-```
-
-The regex captures two numbers:
-- **Group 1**: Current page number within the document (e.g., `3`)
-- **Group 2**: Total pages in the document (e.g., `5`)
-
-Only the first 2000 characters of each page are searched (page numbers typically appear in headers/footers near the top).
-
-### Phase 3: Boundary Detection
-
-The core logic:
-
-```python
-current_page, page_total, doc_title = extract_page_info(text)
-
-if current_page == page_total:
-    # We've found the LAST page of a document!
-    documents.append((current_start, page_num, doc_title))
-
-    # The next PDF page starts a new document
-    current_start = page_num + 1
-```
-
-**Visual representation:**
+### Step 2: For Each PDF Page
 
 ```
-PDF Page Index:  0    1    2    3    4    5    6    7    8    9
-                 |    |    |    |    |    |    |    |    |    |
-Document Page:   1/5  2/5  3/5  4/5  5/5  1/3  2/3  3/3  1/4  2/4...
-                                  ↑              ↑
-                              BOUNDARY       BOUNDARY
-                           (5/5 detected)  (3/3 detected)
+For page_num in range(total_pages):
 
-Result:
-  Document 1: PDF pages 0-4 (5 pages)
-  Document 2: PDF pages 5-7 (3 pages)
-  Document 3: PDF pages 8-... (continues)
+    1. Extract text from page
+
+    2. Check if page has no OCR (< 50 chars)
+       → If yes, increment no_ocr_count
+
+    3. Try Method 1: "Page X of Y"
+       → If found and X == Y: record boundary, reset state
+       → Continue to next page (skip other methods)
+
+    4. Try Method 2: Standalone page number
+       → If found and page == 1 and prev_page > 1:
+         record boundary, reset state
+
+    5. Try Method 3: Header document type
+       → If found and type != prev_type:
+         record boundary, reset state
 ```
 
-### Phase 4: Title Extraction
+### Step 3: Finalize
 
-When a boundary is detected, the algorithm also attempts to extract a document title by looking for legal keywords in the first 10 lines:
-
-```python
-keywords = ['SEARCH WARRANT', 'AFFIDAVIT', 'DISTRICT COURT',
-           'SUBPOENA', 'RETURN', 'MOTION', 'COURT ORDER',
-           'DECLARATION', 'EXHIBIT', 'COMPLAINT']
-```
-
-If a line contains one of these keywords and is between 10-100 characters, it's used as the document title.
-
-### Phase 5: PDF Splitting
-
-Once boundaries are identified, `pypdf` extracts the page ranges:
-
-```python
-for idx, (start_page, end_page, doc_title) in enumerate(documents):
-    writer = PdfWriter()
-
-    for page_idx in range(start_page, end_page + 1):
-        writer.add_page(reader.pages[page_idx])
-
-    writer.write(output_file)
-```
+After scanning all pages, add the final document (from `current_start` to end of PDF).
 
 ---
 
 ## Data Flow Diagram
 
 ```
-┌─────────────────┐
-│   Input PDF     │
-│  (multi-doc)    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  For each page: │
-│  extract_text() │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Search for      │
-│ "Page X of Y"   │
-│ patterns        │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     No      ┌─────────────────┐
-│ current_page == ├────────────►│ Continue to     │
-│ total_pages?    │             │ next page       │
-└────────┬────────┘             └─────────────────┘
-         │ Yes
-         ▼
-┌─────────────────┐
-│ Record boundary │
-│ (start, end,    │
-│  title)         │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Set next page   │
-│ as new doc      │
-│ start           │
-└────────┬────────┘
-         │
-         ▼ (after all pages)
-┌─────────────────┐
-│ Split PDF at    │
-│ recorded        │
-│ boundaries      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Output: N       │
-│ separate PDFs   │
-└─────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      INPUT PDF                               │
+│                   (multi-document)                           │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   FOR EACH PAGE                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌─────────────────┐                                        │
+│  │ Extract Text    │                                        │
+│  └────────┬────────┘                                        │
+│           │                                                  │
+│           ▼                                                  │
+│  ┌─────────────────┐     Yes    ┌──────────────────┐       │
+│  │ Text < 50 chars?├───────────►│ Mark as No-OCR   │       │
+│  └────────┬────────┘            └──────────────────┘       │
+│           │ No                                              │
+│           ▼                                                  │
+│  ┌─────────────────┐     Yes    ┌──────────────────┐       │
+│  │ "Page X of Y"?  ├───────────►│ X == Y?          │       │
+│  └────────┬────────┘            └────────┬─────────┘       │
+│           │ No                           │ Yes              │
+│           │                              ▼                  │
+│           │                     ┌──────────────────┐       │
+│           │                     │ RECORD BOUNDARY  │       │
+│           │                     └──────────────────┘       │
+│           ▼                                                  │
+│  ┌─────────────────┐     Yes    ┌──────────────────┐       │
+│  │ "Page X" only?  ├───────────►│ X==1 & prev>1?   │       │
+│  └────────┬────────┘            └────────┬─────────┘       │
+│           │ No                           │ Yes              │
+│           │                              ▼                  │
+│           │                     ┌──────────────────┐       │
+│           │                     │ RECORD BOUNDARY  │       │
+│           │                     └──────────────────┘       │
+│           ▼                                                  │
+│  ┌─────────────────┐     Yes    ┌──────────────────┐       │
+│  │ Header type?    ├───────────►│ Type changed?    │       │
+│  └────────┬────────┘            └────────┬─────────┘       │
+│           │ No                           │ Yes              │
+│           │                              ▼                  │
+│           │                     ┌──────────────────┐       │
+│           │                     │ RECORD BOUNDARY  │       │
+│           │                     └──────────────────┘       │
+│           │                                                  │
+│           ▼                                                  │
+│       [Next Page]                                           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   SPLIT PDF                                  │
+│            at recorded boundaries                            │
+│                                                              │
+│  Add "No_OCR_" prefix to filenames                          │
+│  if document contains no-OCR pages                          │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   OUTPUT FILES                               │
+│                                                              │
+│  discovery_split_01_search_warrant.pdf                      │
+│  discovery_split_02_affidavit.pdf                           │
+│  No_OCR_discovery_split_03_exhibit.pdf  ← flagged           │
+│  discovery_split_04_return.pdf                              │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Method Priority
+
+The three detection methods are checked in order:
+
+1. **"Page X of Y"** — highest priority, most reliable
+2. **Standalone page reset** — checked if Method 1 doesn't match
+3. **Header type change** — checked if Methods 1 & 2 don't match
+
+If Method 1 finds a match on a page, Methods 2 and 3 are **skipped** for that page. This prevents false positives when multiple signals might occur on the same page.
 
 ---
 
 ## State Variables
 
-The algorithm maintains these state variables while scanning:
-
-| Variable | Purpose |
-|----------|---------|
-| `current_start` | PDF page index where the current document begins |
-| `current_title` | Title of the current document (if detected) |
-| `documents` | List of `(start_page, end_page, title)` tuples |
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `current_start` | int | PDF page index where current document begins |
+| `current_title` | str | Title of current document |
+| `current_no_ocr_count` | int | Number of no-OCR pages in current document |
+| `prev_standalone_page` | int | Previous standalone page number (for reset detection) |
+| `prev_header_type` | str | Previous document type header (for change detection) |
+| `documents` | list | Accumulated list of detected documents |
 
 ---
 
-## Output Filename Generation
+## DocumentInfo Structure
 
-Files are named using this pattern:
+Each detected document is stored as:
+
+```python
+class DocumentInfo(NamedTuple):
+    start_page: int        # PDF page index (0-based) where document starts
+    end_page: int          # PDF page index (0-based) where document ends
+    title: str             # Detected document title
+    has_no_ocr_pages: bool # True if any page had no OCR text
+    no_ocr_page_count: int # Number of pages with no OCR text
+```
+
+---
+
+## Output Filename Format
 
 ```
-{original_filename}_split_{sequence}_{document_type}.pdf
+[No_OCR_]{original_name}_split_{sequence}_{document_type}.pdf
 ```
 
-Example: `discovery_batch_split_01_search_warrant.pdf`
-
-The `document_type` is derived from:
-1. Matching keywords in the title (e.g., "search warrant" → `search_warrant`)
-2. Optionally including case numbers (e.g., `affidavit_tnt-72-24.pdf`)
+Examples:
+```
+discovery_split_01_search_warrant.pdf
+discovery_split_02_affidavit.pdf
+No_OCR_discovery_split_03_exhibit.pdf
+discovery_split_04_return.pdf
+```
 
 ---
 
 ## Edge Cases
 
-### 1. No Page Numbering Detected
+### 1. No Boundaries Detected
 
-If no "Page X of Y" patterns are found, the algorithm returns `None` and reports "single document (no split needed)".
+If none of the three methods detect any boundaries, the function returns `None` and reports "single document (no split needed)".
 
 ### 2. Only One Document Detected
 
-If boundaries are found but result in only one document, no split is performed.
+If boundaries result in only one document, no split is performed.
 
-### 3. Final Document Without Explicit End
+### 3. All Pages Are No-OCR
 
-If the PDF ends without a final "Page X of X" marker, the algorithm includes all remaining pages in the last document:
+The algorithm still attempts to split based on any patterns found. If the entire PDF has no readable text, it will be treated as a single document.
 
-```python
-if current_start < total_pages:
-    documents.append((current_start, total_pages - 1, current_title))
-```
+### 4. Mixed Detection Methods
 
-### 4. OCR Errors
+Different documents in the same PDF can be detected by different methods. For example:
+- Documents 1-2 detected by "Page X of Y"
+- Document 3 detected by header change
+- Document 4 detected by page number reset
 
-The pattern `PA\s*[GE]+\s*(\d+)\s+OF\s*(\d+)` handles common OCR errors where spaces appear in "PAGE" (e.g., "PA GE 3 OF 5").
+### 5. Final Document Without Explicit End
 
-### 5. Pages Without Numbering
-
-Pages that don't match any pattern are silently included in the current document. This handles:
-- Cover pages
-- Exhibits without page numbers
-- Scanned images without OCR text
-
----
-
-## Performance Considerations
-
-| Factor | Impact |
-|--------|--------|
-| **PDF page count** | Linear - each page must be scanned |
-| **Text extraction** | Slowest part - pdfplumber is thorough but slow |
-| **Scanned documents** | Significantly slower than native text PDFs |
-| **Pattern matching** | Fast - only first 2000 chars searched |
-
-For a 500-page scanned document, expect processing times of 5-15 minutes depending on complexity.
-
----
-
-## Limitations
-
-1. **Requires "Page X of Y" format** - Documents without this numbering won't be split
-2. **OCR quality dependent** - Poor scans may not extract page numbers correctly
-3. **Sequential processing** - Each page is processed one at a time
-4. **No machine learning** - Pure pattern matching, won't adapt to unusual formats
+If the PDF ends without a final boundary marker, all remaining pages are included in the last document.
 
 ---
 
@@ -268,39 +320,64 @@ For a 500-page scanned document, expect processing times of 5-15 minutes dependi
 
 ### Adding New Page Number Patterns
 
-Edit `PAGE_PATTERNS` in `split_legal_doc.py`:
+Edit `PAGE_OF_PATTERNS` or `STANDALONE_PAGE_PATTERNS`:
 
 ```python
-PAGE_PATTERNS = [
+PAGE_OF_PATTERNS = [
     r'PAGE\s+(\d+)\s+OF\s+(\d+)',
-    r'Page\s+(\d+)\s+of\s+(\d+)',
     r'(\d+)\s*/\s*(\d+)',           # Add: "3/5" format
-    r'Page\s+(\d+),\s+(\d+)\s+total', # Add: "Page 3, 5 total"
+]
+
+STANDALONE_PAGE_PATTERNS = [
+    r'PAGE\s+(\d+)\s*$',
+    r'\[(\d+)\]',                   # Add: "[3]" format
 ]
 ```
 
 ### Adding Document Type Keywords
 
-Edit `DOCUMENT_TYPES` to add jurisdiction-specific terminology:
+Edit `HEADER_DOC_TYPES`:
 
 ```python
-DOCUMENT_TYPES = {
-    'search warrant': 'search_warrant',
-    'arrest warrant': 'arrest_warrant',  # Add new types
-    'grand jury subpoena': 'grand_jury_subpoena',
-}
+HEADER_DOC_TYPES = [
+    'SEARCH WARRANT',
+    'AFFIDAVIT',
+    'GRAND JURY SUBPOENA',  # Add jurisdiction-specific types
+    'ARREST WARRANT',
+]
 ```
+
+### Adjusting No-OCR Threshold
+
+Edit `MIN_TEXT_LENGTH`:
+
+```python
+MIN_TEXT_LENGTH = 50  # Increase for stricter detection
+```
+
+---
+
+## Performance Considerations
+
+| Factor | Impact |
+|--------|--------|
+| PDF page count | Linear — each page scanned once |
+| Text extraction | Slowest operation (pdfplumber) |
+| Pattern matching | Fast — limited to header/footer regions |
+| Scanned documents | Significantly slower than native PDFs |
+
+For a 500-page scanned document, expect 5-15 minutes processing time.
 
 ---
 
 ## Summary
 
-The algorithm works by:
+The algorithm detects document boundaries using three methods:
 
-1. **Scanning** each PDF page for text
-2. **Searching** for "Page X of Y" patterns
-3. **Detecting boundaries** when `X == Y` (last page of a document)
-4. **Recording** the page ranges and titles
-5. **Splitting** the PDF at those boundaries
+| Method | Signal | Boundary When |
+|--------|--------|---------------|
+| Page X of Y | "Page 5 of 5" | X equals Y |
+| Standalone page | "Page 1" after "Page 3" | Resets to 1 |
+| Header type | "AFFIDAVIT" → "WARRANT" | Type changes |
 
-The key insight is that **the last page of each document reveals its boundary** through its page numbering.
+Documents with pages containing no OCR text are flagged with a `No_OCR_` filename prefix for manual review.

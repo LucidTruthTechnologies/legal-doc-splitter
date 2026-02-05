@@ -3,7 +3,10 @@
 Legal Document Splitter
 
 Automatically splits multi-document PDF files into individual documents
-using page numbering pattern recognition.
+using multiple boundary detection methods:
+1. Page numbering patterns ("Page X of Y" or standalone "Page X")
+2. Document type header changes (e.g., AFFIDAVIT → SEARCH WARRANT)
+3. Page number reset detection (Page 3 → Page 1)
 
 Author: Created for legal discovery document processing
 License: MIT
@@ -13,7 +16,7 @@ import sys
 import argparse
 from pathlib import Path
 import re
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, NamedTuple
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 
@@ -22,22 +25,55 @@ from pypdf import PdfReader, PdfWriter
 # CONFIGURATION
 # ============================================================================
 
-# Page numbering patterns to detect (regex patterns)
-# These patterns look for "Page X of Y" variations
-PAGE_PATTERNS = [
-    r'PAGE\s+(\d+)\s+OF\s+(\d+)',      # "PAGE 3 OF 5"
+# Page numbering patterns - "Page X of Y" format
+PAGE_OF_PATTERNS = [
+    r'PAGE\s+(\d+)\s+OF\s+(\d+)',       # "PAGE 3 OF 5"
     r'PA\s*[GE]+\s*(\d+)\s+OF\s*(\d+)', # Handles OCR errors
-    r'Page\s+(\d+)\s+of\s+(\d+)',      # "Page 3 of 5"
+    r'Page\s+(\d+)\s+of\s+(\d+)',       # "Page 3 of 5"
+    r'(\d+)\s+of\s+(\d+)\s+pages?',     # "3 of 5 pages"
 ]
 
-# Document type keywords and their clean names
-# Add your jurisdiction's specific terminology here
+# Standalone page number patterns - "Page X" without "of Y"
+STANDALONE_PAGE_PATTERNS = [
+    r'PAGE\s+(\d+)\s*$',                # "PAGE 3" at end of line
+    r'Page\s+(\d+)\s*$',                # "Page 3" at end of line
+    r'^PAGE\s+(\d+)',                   # "PAGE 3" at start of line
+    r'^Page\s+(\d+)',                   # "Page 3" at start of line
+    r'[-–—]\s*(\d+)\s*[-–—]',           # "- 3 -" or "— 3 —"
+    r'PAGE\s+(\d+)\s*\n',               # "PAGE 3" followed by newline
+    r'Page\s+(\d+)\s*\n',               # "Page 3" followed by newline
+]
+
+# Document type keywords for header detection
+# These are checked in headers to detect document type changes
+HEADER_DOC_TYPES = [
+    'SEARCH WARRANT',
+    'AFFIDAVIT',
+    'SUBPOENA',
+    'COURT ORDER',
+    'RETURN AND TABULATION',
+    'RETURN OF SERVICE',
+    'MOTION',
+    'DECLARATION',
+    'EXHIBIT',
+    'COMPLAINT',
+    'ANSWER',
+    'SUMMONS',
+    'PETITION',
+    'ORDER',
+    'WARRANT',
+    'NOTICE',
+    'CERTIFICATE',
+]
+
+# Document type keywords and their clean names for filenames
 DOCUMENT_TYPES = {
     'search warrant': 'search_warrant',
     'affidavit': 'affidavit',
     'subpoena': 'subpoena',
     'court order': 'court_order',
     'return and tabulation': 'return_tabulation',
+    'return of service': 'return_of_service',
     'return': 'return',
     'motion': 'motion',
     'declaration': 'declaration',
@@ -45,6 +81,11 @@ DOCUMENT_TYPES = {
     'complaint': 'complaint',
     'answer': 'answer',
     'summons': 'summons',
+    'petition': 'petition',
+    'order': 'order',
+    'warrant': 'warrant',
+    'notice': 'notice',
+    'certificate': 'certificate',
 }
 
 # Case number patterns (customize for your jurisdiction)
@@ -56,42 +97,104 @@ CASE_PATTERNS = [
     r'case\s*(?:no|number)[:\s]*([a-z0-9\-]+)',  # Case No: XXX
 ]
 
+# Minimum characters to consider a page as having OCR text
+MIN_TEXT_LENGTH = 50
+
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+class DocumentInfo(NamedTuple):
+    """Information about a detected document segment."""
+    start_page: int
+    end_page: int
+    title: str
+    has_no_ocr_pages: bool
+    no_ocr_page_count: int
+
 
 # ============================================================================
 # CORE FUNCTIONS
 # ============================================================================
 
-def extract_page_info(text: str, debug: bool = False) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+def extract_page_of_info(text: str, debug: bool = False) -> Tuple[Optional[int], Optional[int]]:
     """
-    Extract page numbering information and document title from page text.
+    Extract "Page X of Y" numbering from page text.
 
     Args:
         text: Text content from a PDF page
         debug: If True, print debug information
 
     Returns:
-        Tuple of (current_page, total_pages, document_title)
-        Returns (None, None, None) if no page numbering found
+        Tuple of (current_page, total_pages) or (None, None) if not found
     """
-    # Search first 2000 characters (page numbers usually appear early)
-    text_upper = text[:2000].upper()
+    # Search first 2000 characters and last 500 (header/footer areas)
+    search_text = text[:2000] + "\n" + text[-500:] if len(text) > 2500 else text
+    search_upper = search_text.upper()
 
-    # Try each page numbering pattern
-    for pattern in PAGE_PATTERNS:
-        match = re.search(pattern, text_upper, re.IGNORECASE)
+    for pattern in PAGE_OF_PATTERNS:
+        match = re.search(pattern, search_upper, re.IGNORECASE | re.MULTILINE)
         if match:
             current_page = int(match.group(1))
             total_pages = int(match.group(2))
-
             if debug:
                 print(f"    Found: Page {current_page} of {total_pages}")
+            return (current_page, total_pages)
 
-            # Extract document title (usually in first few lines)
-            title = extract_document_title(text)
+    return (None, None)
 
-            return (current_page, total_pages, title)
 
-    return (None, None, None)
+def extract_standalone_page(text: str, debug: bool = False) -> Optional[int]:
+    """
+    Extract standalone page number (without "of Y") from page text.
+
+    Args:
+        text: Text content from a PDF page
+        debug: If True, print debug information
+
+    Returns:
+        Page number if found, None otherwise
+    """
+    # Search header and footer areas
+    search_text = text[:1000] + "\n" + text[-500:] if len(text) > 1500 else text
+
+    for pattern in STANDALONE_PAGE_PATTERNS:
+        match = re.search(pattern, search_text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            page_num = int(match.group(1))
+            # Sanity check - page numbers are usually reasonable
+            if 1 <= page_num <= 9999:
+                if debug:
+                    print(f"    Found standalone: Page {page_num}")
+                return page_num
+
+    return None
+
+
+def extract_header_doc_type(text: str, debug: bool = False) -> Optional[str]:
+    """
+    Extract document type from page header.
+
+    Looks for document type keywords in the first 500 characters
+    (typically the header area).
+
+    Args:
+        text: Text content from a PDF page
+        debug: If True, print debug information
+
+    Returns:
+        Document type string if found, None otherwise
+    """
+    header_text = text[:500].upper()
+
+    for doc_type in HEADER_DOC_TYPES:
+        if doc_type in header_text:
+            if debug:
+                print(f"    Header type: {doc_type}")
+            return doc_type
+
+    return None
 
 
 def extract_document_title(text: str) -> Optional[str]:
@@ -118,27 +221,45 @@ def extract_document_title(text: str) -> Optional[str]:
 
         # Check if contains legal document keywords
         line_upper = line_clean.upper()
-        keywords = ['SEARCH WARRANT', 'AFFIDAVIT', 'DISTRICT COURT',
-                   'SUBPOENA', 'RETURN', 'MOTION', 'COURT ORDER',
-                   'DECLARATION', 'EXHIBIT', 'COMPLAINT']
-
-        if any(keyword in line_upper for keyword in keywords):
+        if any(doc_type in line_upper for doc_type in HEADER_DOC_TYPES):
             return line_clean
 
     return None
 
 
-def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[Tuple[int, int, str]]]:
+def is_page_no_ocr(text: str) -> bool:
+    """
+    Check if a page has insufficient OCR text.
+
+    Args:
+        text: Extracted text from page
+
+    Returns:
+        True if page appears to have no/insufficient OCR text
+    """
+    if not text:
+        return True
+    # Strip whitespace and check length
+    clean_text = text.strip()
+    return len(clean_text) < MIN_TEXT_LENGTH
+
+
+def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentInfo]]:
     """
     Analyze a PDF file to detect document boundaries.
+
+    Uses multiple detection methods:
+    1. "Page X of Y" patterns - boundary when X == Y
+    2. Standalone "Page X" - boundary when page resets to 1
+    3. Header document type changes - boundary when type changes
 
     Args:
         pdf_path: Path to PDF file
         debug: If True, print debug information
 
     Returns:
-        List of tuples (start_page, end_page, title) for each document
-        Returns None if no page numbering detected or only 1 document
+        List of DocumentInfo tuples for each document
+        Returns None if no boundaries detected or only 1 document
     """
     if debug:
         print(f"\nAnalyzing: {pdf_path.name}")
@@ -147,68 +268,154 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[Tuple[int,
     documents = []
     current_start = 0
     current_title = None
+    current_no_ocr_count = 0
+
+    # State tracking for boundary detection
+    prev_standalone_page = None
+    prev_header_type = None
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            total_pages = len(pdf.pages)
+            total_pdf_pages = len(pdf.pages)
 
             if debug:
-                print(f"Total pages: {total_pages}\n")
+                print(f"Total pages: {total_pdf_pages}\n")
 
-            for page_num in range(total_pages):
-                # Progress indicator (always show so user knows it's working)
-                print(f"\r  Scanning page {page_num + 1}/{total_pages}...", end="", flush=True)
+            for page_num in range(total_pdf_pages):
+                # Progress indicator
+                print(f"\r  Scanning page {page_num + 1}/{total_pdf_pages}...", end="", flush=True)
 
                 try:
                     page = pdf.pages[page_num]
                     text = page.extract_text() or ""
 
-                    current_page, page_total, doc_title = extract_page_info(text, debug)
+                    # Track no-OCR pages
+                    if is_page_no_ocr(text):
+                        current_no_ocr_count += 1
+                        if debug:
+                            print(f"\n    Page {page_num + 1}: No OCR text detected")
+
+                    # === METHOD 1: "Page X of Y" detection ===
+                    current_page, page_total = extract_page_of_info(text, debug)
 
                     if current_page and page_total:
                         # Check if this is the last page of a document
                         if current_page == page_total:
-                            documents.append((
-                                current_start,
-                                page_num,
-                                doc_title or "Unknown"
+                            doc_title = extract_document_title(text) or current_title or "Unknown"
+                            documents.append(DocumentInfo(
+                                start_page=current_start,
+                                end_page=page_num,
+                                title=doc_title,
+                                has_no_ocr_pages=current_no_ocr_count > 0,
+                                no_ocr_page_count=current_no_ocr_count
                             ))
 
                             if debug:
-                                print(f"  Page {page_num + 1}: Document ends")
+                                print(f"\n  Page {page_num + 1}: Document ends (Page {current_page} of {page_total})")
                                 print(f"    Range: pages {current_start + 1}-{page_num + 1}")
+                                if current_no_ocr_count > 0:
+                                    print(f"    No-OCR pages: {current_no_ocr_count}")
 
-                            # Next page starts new document
-                            if page_num + 1 < total_pages:
+                            # Reset for next document
+                            if page_num + 1 < total_pdf_pages:
                                 current_start = page_num + 1
                                 current_title = None
+                                current_no_ocr_count = 0
+                                prev_standalone_page = None
+                                prev_header_type = None
 
-                        if doc_title and not current_title:
-                            current_title = doc_title
+                        # Update title if found
+                        if not current_title:
+                            current_title = extract_document_title(text)
+
+                        continue  # Skip other detection methods if Page X of Y found
+
+                    # === METHOD 2: Standalone page number reset detection ===
+                    standalone_page = extract_standalone_page(text, debug)
+
+                    if standalone_page is not None:
+                        # Boundary if page resets to 1 (and we had a previous page > 1)
+                        if standalone_page == 1 and prev_standalone_page is not None and prev_standalone_page > 1:
+                            # The PREVIOUS page was the end of a document
+                            if page_num > current_start:  # Ensure we have pages to split
+                                doc_title = current_title or "Unknown"
+                                documents.append(DocumentInfo(
+                                    start_page=current_start,
+                                    end_page=page_num - 1,
+                                    title=doc_title,
+                                    has_no_ocr_pages=current_no_ocr_count > 0,
+                                    no_ocr_page_count=current_no_ocr_count
+                                ))
+
+                                if debug:
+                                    print(f"\n  Page {page_num + 1}: New document (page reset to 1)")
+                                    print(f"    Previous doc range: pages {current_start + 1}-{page_num}")
+
+                                # Reset for new document
+                                current_start = page_num
+                                current_title = extract_document_title(text)
+                                current_no_ocr_count = 0 if not is_page_no_ocr(text) else 1
+                                prev_header_type = None
+
+                        prev_standalone_page = standalone_page
+
+                    # === METHOD 3: Header document type change detection ===
+                    header_type = extract_header_doc_type(text, debug)
+
+                    if header_type:
+                        # Boundary if document type changed
+                        if prev_header_type is not None and header_type != prev_header_type:
+                            # The PREVIOUS page was the end of a document
+                            if page_num > current_start:
+                                doc_title = current_title or prev_header_type or "Unknown"
+                                documents.append(DocumentInfo(
+                                    start_page=current_start,
+                                    end_page=page_num - 1,
+                                    title=doc_title,
+                                    has_no_ocr_pages=current_no_ocr_count > 0,
+                                    no_ocr_page_count=current_no_ocr_count
+                                ))
+
+                                if debug:
+                                    print(f"\n  Page {page_num + 1}: New document (header changed: {prev_header_type} → {header_type})")
+                                    print(f"    Previous doc range: pages {current_start + 1}-{page_num}")
+
+                                # Reset for new document
+                                current_start = page_num
+                                current_title = extract_document_title(text) or header_type
+                                current_no_ocr_count = 0 if not is_page_no_ocr(text) else 1
+                                prev_standalone_page = standalone_page
+
+                        prev_header_type = header_type
+
+                        # Update title if not set
+                        if not current_title:
+                            current_title = extract_document_title(text) or header_type
 
                 except Exception as e:
                     if debug:
-                        print(f"  Error on page {page_num + 1}: {e}")
+                        print(f"\n  Error on page {page_num + 1}: {e}")
 
             # Clear the progress line
-            print("\r" + " " * 40 + "\r", end="", flush=True)
+            print("\r" + " " * 50 + "\r", end="", flush=True)
 
             # Add final document if we have boundaries
-            if current_start < total_pages:
+            if current_start < total_pdf_pages:
                 if len(documents) == 0:
-                    # No page numbering detected
                     if debug:
-                        print("No page numbering patterns detected")
+                        print("No document boundaries detected")
                     return None
                 else:
-                    documents.append((
-                        current_start,
-                        total_pages - 1,
-                        current_title or "Unknown"
+                    documents.append(DocumentInfo(
+                        start_page=current_start,
+                        end_page=total_pdf_pages - 1,
+                        title=current_title or "Unknown",
+                        has_no_ocr_pages=current_no_ocr_count > 0,
+                        no_ocr_page_count=current_no_ocr_count
                     ))
 
                     if debug:
-                        print(f"  Final document: pages {current_start + 1}-{total_pages}")
+                        print(f"  Final document: pages {current_start + 1}-{total_pdf_pages}")
 
     except Exception as e:
         print(f"Error analyzing PDF: {e}", file=sys.stderr)
@@ -218,6 +425,9 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[Tuple[int,
     if len(documents) > 1:
         if debug:
             print(f"\nDetected {len(documents)} separate documents")
+            no_ocr_docs = sum(1 for d in documents if d.has_no_ocr_pages)
+            if no_ocr_docs > 0:
+                print(f"  {no_ocr_docs} document(s) contain pages with no OCR text")
         return documents
     else:
         if debug:
@@ -257,7 +467,7 @@ def clean_filename(text: str) -> str:
     return doc_type
 
 
-def split_pdf(pdf_path: Path, documents: List[Tuple[int, int, str]],
+def split_pdf(pdf_path: Path, documents: List[DocumentInfo],
               output_dir: Path, delete_original: bool = False,
               debug: bool = False) -> List[Path]:
     """
@@ -265,7 +475,7 @@ def split_pdf(pdf_path: Path, documents: List[Tuple[int, int, str]],
 
     Args:
         pdf_path: Path to input PDF
-        documents: List of (start_page, end_page, title) tuples
+        documents: List of DocumentInfo tuples
         output_dir: Directory for output files
         delete_original: If True, delete original file after successful split
         debug: If True, print debug information
@@ -281,12 +491,13 @@ def split_pdf(pdf_path: Path, documents: List[Tuple[int, int, str]],
     base_name = pdf_path.stem
     output_files = []
 
-    for idx, (start_page, end_page, doc_title) in enumerate(documents):
-        num_pages = end_page - start_page + 1
+    for idx, doc in enumerate(documents):
+        num_pages = doc.end_page - doc.start_page + 1
 
-        # Create filename
-        doc_type_clean = clean_filename(doc_title)
-        filename = f"{base_name}_split_{idx + 1:02d}_{doc_type_clean}.pdf"
+        # Create filename with No_OCR prefix if needed
+        doc_type_clean = clean_filename(doc.title)
+        prefix = "No_OCR_" if doc.has_no_ocr_pages else ""
+        filename = f"{prefix}{base_name}_split_{idx + 1:02d}_{doc_type_clean}.pdf"
         output_path = output_dir / filename
 
         try:
@@ -294,7 +505,7 @@ def split_pdf(pdf_path: Path, documents: List[Tuple[int, int, str]],
             writer = PdfWriter()
 
             # Add pages
-            for page_idx in range(start_page, end_page + 1):
+            for page_idx in range(doc.start_page, doc.end_page + 1):
                 writer.add_page(reader.pages[page_idx])
 
             # Write file
@@ -305,9 +516,12 @@ def split_pdf(pdf_path: Path, documents: List[Tuple[int, int, str]],
 
             if debug:
                 print(f"  [{idx + 1}/{len(documents)}] Created: {filename}")
-                print(f"      Pages {start_page + 1}-{end_page + 1} ({num_pages} pages, {size_kb:.1f} KB)")
+                print(f"      Pages {doc.start_page + 1}-{doc.end_page + 1} ({num_pages} pages, {size_kb:.1f} KB)")
+                if doc.has_no_ocr_pages:
+                    print(f"      ⚠ Contains {doc.no_ocr_page_count} page(s) with no OCR text")
             else:
-                print(f"  → {filename} (pages {start_page + 1}-{end_page + 1})")
+                status = " [No OCR]" if doc.has_no_ocr_pages else ""
+                print(f"  → {filename} (pages {doc.start_page + 1}-{doc.end_page + 1}){status}")
 
             output_files.append(output_path)
 
@@ -342,7 +556,12 @@ Examples:
   %(prog)s --debug --dry-run document.pdf
   %(prog)s --delete-original document.pdf
 
-For more information, see README.md
+Boundary Detection Methods:
+  1. "Page X of Y" patterns - splits when X equals Y
+  2. Standalone page numbers - splits when page resets to 1
+  3. Header document type - splits when type changes (e.g., AFFIDAVIT → WARRANT)
+
+For more information, see README.md and ALGORITHM.md
         """
     )
 
@@ -388,16 +607,22 @@ For more information, see README.md
 
     if not args.debug:
         print(f"{len(documents)} documents detected")
+        no_ocr_count = sum(1 for d in documents if d.has_no_ocr_pages)
+        if no_ocr_count > 0:
+            print(f"  ⚠ {no_ocr_count} document(s) contain pages with no OCR text")
 
     # Dry run mode
     if args.dry_run:
         print("\nDry run mode - no files will be created\n")
-        for idx, (start, end, title) in enumerate(documents):
-            doc_type = clean_filename(title)
-            filename = f"{args.pdf_file.stem}_split_{idx + 1:02d}_{doc_type}.pdf"
+        for idx, doc in enumerate(documents):
+            doc_type = clean_filename(doc.title)
+            prefix = "No_OCR_" if doc.has_no_ocr_pages else ""
+            filename = f"{prefix}{args.pdf_file.stem}_split_{idx + 1:02d}_{doc_type}.pdf"
             print(f"  Would create: {filename}")
-            print(f"    Pages {start + 1}-{end + 1} ({end - start + 1} pages)")
-            print(f"    Title: {title[:60]}")
+            print(f"    Pages {doc.start_page + 1}-{doc.end_page + 1} ({doc.end_page - doc.start_page + 1} pages)")
+            print(f"    Title: {doc.title[:60]}")
+            if doc.has_no_ocr_pages:
+                print(f"    ⚠ No OCR pages: {doc.no_ocr_page_count}")
         return 0
 
     # Split PDF
