@@ -224,10 +224,10 @@ After scanning all pages, add the final document (from `current_start` to end of
 ┌─────────────────────────────────────────────────────────────┐
 │                   OUTPUT FILES                               │
 │                                                              │
-│  discovery_split_01_search_warrant.pdf                      │
-│  discovery_split_02_affidavit.pdf                           │
-│  No_OCR_discovery_split_03_exhibit.pdf  ← flagged           │
-│  discovery_split_04_return.pdf                              │
+│  search_warrant_001.pdf                                     │
+│  affidavit_001.pdf                                          │
+│  No_OCR_exhibit_001.pdf  ← flagged for review               │
+│  return_tabulation_001.pdf                                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -275,17 +275,27 @@ class DocumentInfo(NamedTuple):
 
 ## Output Filename Format
 
+Files are named by document type with **per-type counters**:
+
 ```
-[No_OCR_]{original_name}_split_{sequence}_{document_type}.pdf
+[No_OCR_]{document_type}_{NNN}.pdf
 ```
+
+Where `NNN` is a 3-digit counter that increments **per document type**, not globally.
 
 Examples:
 ```
-discovery_split_01_search_warrant.pdf
-discovery_split_02_affidavit.pdf
-No_OCR_discovery_split_03_exhibit.pdf
-discovery_split_04_return.pdf
+search_warrant_001.pdf      ← First search warrant
+affidavit_001.pdf           ← First affidavit
+search_warrant_002.pdf      ← Second search warrant
+No_OCR_exhibit_001.pdf      ← First exhibit (has no-OCR pages)
+return_tabulation_001.pdf   ← First return
 ```
+
+This naming scheme produces meaningful, organized filenames where:
+- Documents of the same type are grouped together when sorted
+- Each type maintains its own sequential numbering
+- The `No_OCR_` prefix flags documents needing manual review
 
 ---
 

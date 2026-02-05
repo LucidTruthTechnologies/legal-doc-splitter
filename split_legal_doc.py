@@ -473,6 +473,9 @@ def split_pdf(pdf_path: Path, documents: List[DocumentInfo],
     """
     Split PDF into separate files based on detected boundaries.
 
+    Files are named by document type with per-type counters:
+        search_warrant_001.pdf, affidavit_001.pdf, search_warrant_002.pdf
+
     Args:
         pdf_path: Path to input PDF
         documents: List of DocumentInfo tuples
@@ -488,16 +491,24 @@ def split_pdf(pdf_path: Path, documents: List[DocumentInfo],
         print("=" * 70)
 
     reader = PdfReader(pdf_path)
-    base_name = pdf_path.stem
     output_files = []
+
+    # Track per-type counters for meaningful filenames
+    type_counters: dict[str, int] = {}
 
     for idx, doc in enumerate(documents):
         num_pages = doc.end_page - doc.start_page + 1
 
-        # Create filename with No_OCR prefix if needed
+        # Get clean document type name
         doc_type_clean = clean_filename(doc.title)
+
+        # Increment per-type counter
+        type_counters[doc_type_clean] = type_counters.get(doc_type_clean, 0) + 1
+        type_count = type_counters[doc_type_clean]
+
+        # Create filename: {type}_{NNN}.pdf with optional No_OCR prefix
         prefix = "No_OCR_" if doc.has_no_ocr_pages else ""
-        filename = f"{prefix}{base_name}_split_{idx + 1:02d}_{doc_type_clean}.pdf"
+        filename = f"{prefix}{doc_type_clean}_{type_count:03d}.pdf"
         output_path = output_dir / filename
 
         try:
@@ -614,10 +625,13 @@ For more information, see README.md and ALGORITHM.md
     # Dry run mode
     if args.dry_run:
         print("\nDry run mode - no files will be created\n")
+        type_counters: dict[str, int] = {}
         for idx, doc in enumerate(documents):
             doc_type = clean_filename(doc.title)
+            type_counters[doc_type] = type_counters.get(doc_type, 0) + 1
+            type_count = type_counters[doc_type]
             prefix = "No_OCR_" if doc.has_no_ocr_pages else ""
-            filename = f"{prefix}{args.pdf_file.stem}_split_{idx + 1:02d}_{doc_type}.pdf"
+            filename = f"{prefix}{doc_type}_{type_count:03d}.pdf"
             print(f"  Would create: {filename}")
             print(f"    Pages {doc.start_page + 1}-{doc.end_page + 1} ({doc.end_page - doc.start_page + 1} pages)")
             print(f"    Title: {doc.title[:60]}")
