@@ -1,0 +1,12 @@
+# Legal Document Splitter - Python Dependencies
+
+# PDF text extraction
+pdfplumber>=0.9.0
+
+# PDF manipulation
+pypdf>=3.0.0
+
+# Optional: For OCR on scanned documents
+# Uncomment if you need to process scanned PDFs
+# pytesseract>=0.3.10
+# pdf2image>=1.16.0
