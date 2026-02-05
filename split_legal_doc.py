@@ -14,9 +14,11 @@ License: MIT
 
 import sys
 import argparse
+import gc
+import json
 from pathlib import Path
 import re
-from typing import List, Tuple, Optional, NamedTuple
+from typing import List, Tuple, Optional, NamedTuple, Dict, Any
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 
@@ -100,6 +102,9 @@ CASE_PATTERNS = [
 # Minimum characters to consider a page as having OCR text
 MIN_TEXT_LENGTH = 50
 
+# Checkpoint interval - save progress every N pages
+CHECKPOINT_INTERVAL = 50
+
 
 # ============================================================================
 # DATA STRUCTURES
@@ -112,6 +117,73 @@ class DocumentInfo(NamedTuple):
     title: str
     has_no_ocr_pages: bool
     no_ocr_page_count: int
+
+
+# ============================================================================
+# CHECKPOINT FUNCTIONS
+# ============================================================================
+
+def get_checkpoint_path(pdf_path: Path, output_dir: Path) -> Path:
+    """Get the checkpoint file path for a given PDF."""
+    return output_dir / f".{pdf_path.stem}.checkpoint.json"
+
+
+def save_checkpoint(checkpoint_path: Path, data: Dict[str, Any]) -> None:
+    """Save checkpoint data to disk."""
+    try:
+        with open(checkpoint_path, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save checkpoint: {e}", file=sys.stderr)
+
+
+def load_checkpoint(checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+    """Load checkpoint data from disk."""
+    if not checkpoint_path.exists():
+        return None
+    try:
+        with open(checkpoint_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint: {e}", file=sys.stderr)
+        return None
+
+
+def delete_checkpoint(checkpoint_path: Path) -> None:
+    """Delete checkpoint file after successful completion."""
+    try:
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+    except Exception:
+        pass  # Ignore errors deleting checkpoint
+
+
+def documents_to_list(documents: List[DocumentInfo]) -> List[Dict]:
+    """Convert DocumentInfo list to JSON-serializable list."""
+    return [
+        {
+            'start_page': d.start_page,
+            'end_page': d.end_page,
+            'title': d.title,
+            'has_no_ocr_pages': d.has_no_ocr_pages,
+            'no_ocr_page_count': d.no_ocr_page_count
+        }
+        for d in documents
+    ]
+
+
+def list_to_documents(data: List[Dict]) -> List[DocumentInfo]:
+    """Convert JSON list back to DocumentInfo list."""
+    return [
+        DocumentInfo(
+            start_page=d['start_page'],
+            end_page=d['end_page'],
+            title=d['title'],
+            has_no_ocr_pages=d['has_no_ocr_pages'],
+            no_ocr_page_count=d['no_ocr_page_count']
+        )
+        for d in data
+    ]
 
 
 # ============================================================================
@@ -244,7 +316,8 @@ def is_page_no_ocr(text: str) -> bool:
     return len(clean_text) < MIN_TEXT_LENGTH
 
 
-def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentInfo]]:
+def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
+                resume: bool = False) -> Optional[List[DocumentInfo]]:
     """
     Analyze a PDF file to detect document boundaries.
 
@@ -253,26 +326,50 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentIn
     2. Standalone "Page X" - boundary when page resets to 1
     3. Header document type changes - boundary when type changes
 
+    Supports checkpointing for crash recovery on large PDFs.
+
     Args:
         pdf_path: Path to PDF file
+        output_dir: Directory for checkpoint file (default: same as PDF)
         debug: If True, print debug information
+        resume: If True, resume from checkpoint if available
 
     Returns:
         List of DocumentInfo tuples for each document
         Returns None if no boundaries detected or only 1 document
     """
+    if output_dir is None:
+        output_dir = pdf_path.parent
+
+    checkpoint_path = get_checkpoint_path(pdf_path, output_dir)
+
     if debug:
         print(f"\nAnalyzing: {pdf_path.name}")
         print("=" * 70)
 
+    # Initialize state
     documents = []
     current_start = 0
     current_title = None
     current_no_ocr_count = 0
-
-    # State tracking for boundary detection
     prev_standalone_page = None
     prev_header_type = None
+    start_page = 0
+
+    # Check for existing checkpoint
+    if resume and checkpoint_path.exists():
+        checkpoint = load_checkpoint(checkpoint_path)
+        if checkpoint and checkpoint.get('pdf_path') == str(pdf_path):
+            print(f"  Resuming from checkpoint (page {checkpoint['last_page'] + 1})...")
+            documents = list_to_documents(checkpoint.get('documents', []))
+            current_start = checkpoint.get('current_start', 0)
+            current_title = checkpoint.get('current_title')
+            current_no_ocr_count = checkpoint.get('current_no_ocr_count', 0)
+            prev_standalone_page = checkpoint.get('prev_standalone_page')
+            prev_header_type = checkpoint.get('prev_header_type')
+            start_page = checkpoint['last_page'] + 1
+            if debug:
+                print(f"  Loaded {len(documents)} documents from checkpoint")
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -281,13 +378,40 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentIn
             if debug:
                 print(f"Total pages: {total_pdf_pages}\n")
 
-            for page_num in range(total_pdf_pages):
-                # Progress indicator
-                print(f"\r  Scanning page {page_num + 1}/{total_pdf_pages}...", end="", flush=True)
+            if start_page >= total_pdf_pages:
+                print("  Already fully processed.")
+                delete_checkpoint(checkpoint_path)
+                return documents if len(documents) > 1 else None
+
+            for page_num in range(start_page, total_pdf_pages):
+                # Progress indicator with checkpoint info
+                docs_found = len(documents)
+                print(f"\r  Scanning page {page_num + 1}/{total_pdf_pages} ({docs_found} docs found)...", end="", flush=True)
 
                 try:
                     page = pdf.pages[page_num]
                     text = page.extract_text() or ""
+
+                    # Memory management: flush page cache after text extraction
+                    if hasattr(page, 'flush_cache'):
+                        page.flush_cache()
+
+                    # Periodic checkpoint and garbage collection
+                    if page_num > 0 and page_num % CHECKPOINT_INTERVAL == 0:
+                        # Save checkpoint
+                        checkpoint_data = {
+                            'pdf_path': str(pdf_path),
+                            'total_pages': total_pdf_pages,
+                            'last_page': page_num,
+                            'documents': documents_to_list(documents),
+                            'current_start': current_start,
+                            'current_title': current_title,
+                            'current_no_ocr_count': current_no_ocr_count,
+                            'prev_standalone_page': prev_standalone_page,
+                            'prev_header_type': prev_header_type,
+                        }
+                        save_checkpoint(checkpoint_path, checkpoint_data)
+                        gc.collect()
 
                     # Track no-OCR pages
                     if is_page_no_ocr(text):
@@ -395,6 +519,9 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentIn
                 except Exception as e:
                     if debug:
                         print(f"\n  Error on page {page_num + 1}: {e}")
+                finally:
+                    # Ensure text is cleared to help GC
+                    text = None
 
             # Clear the progress line
             print("\r" + " " * 50 + "\r", end="", flush=True)
@@ -417,8 +544,16 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentIn
                     if debug:
                         print(f"  Final document: pages {current_start + 1}-{total_pdf_pages}")
 
+        # Final cleanup after PDF processing
+        gc.collect()
+
+        # Delete checkpoint on successful completion
+        delete_checkpoint(checkpoint_path)
+
     except Exception as e:
-        print(f"Error analyzing PDF: {e}", file=sys.stderr)
+        print(f"\nError analyzing PDF: {e}", file=sys.stderr)
+        print(f"  Checkpoint saved - use --resume to continue", file=sys.stderr)
+        gc.collect()
         return None
 
     # Only return if we found multiple documents
@@ -432,6 +567,7 @@ def analyze_pdf(pdf_path: Path, debug: bool = False) -> Optional[List[DocumentIn
     else:
         if debug:
             print("\nOnly 1 document detected (no split needed)")
+        delete_checkpoint(checkpoint_path)  # Clean up checkpoint
         return None
 
 
@@ -566,11 +702,16 @@ Examples:
   %(prog)s --output-dir ./split/ document.pdf
   %(prog)s --debug --dry-run document.pdf
   %(prog)s --delete-original document.pdf
+  %(prog)s --resume large_document.pdf    # Resume after crash
 
 Boundary Detection Methods:
   1. "Page X of Y" patterns - splits when X equals Y
   2. Standalone page numbers - splits when page resets to 1
   3. Header document type - splits when type changes (e.g., AFFIDAVIT → WARRANT)
+
+Crash Recovery:
+  Progress is checkpointed every 50 pages. If the script crashes on a large
+  PDF, use --resume to continue from where it left off.
 
 For more information, see README.md and ALGORITHM.md
         """
@@ -587,6 +728,9 @@ For more information, see README.md and ALGORITHM.md
 
     parser.add_argument('--dry-run', action='store_true',
                        help='Show what would be done without creating files')
+
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume from checkpoint if previous run crashed')
 
     parser.add_argument('--debug', action='store_true',
                        help='Print debug information')
@@ -609,7 +753,12 @@ For more information, see README.md and ALGORITHM.md
     # Analyze PDF
     print(f"Processing: {args.pdf_file.name}")
 
-    documents = analyze_pdf(args.pdf_file, debug=args.debug)
+    documents = analyze_pdf(
+        args.pdf_file,
+        output_dir=output_dir,
+        debug=args.debug,
+        resume=args.resume
+    )
 
     if not documents:
         if not args.debug:
