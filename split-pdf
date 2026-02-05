@@ -1,0 +1,10 @@
+#!/bin/bash
+#
+# split-pdf - Split multi-document legal PDFs into individual documents
+#
+# Usage: split-pdf [OPTIONS] PDF_FILE
+#        split-pdf --help
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/split_legal_doc.py" "$@"

@@ -1,0 +1,10 @@
+#!/bin/bash
+#
+# batch-split-pdf - Batch process directory of legal PDFs
+#
+# Usage: batch-split-pdf [OPTIONS] DIRECTORY
+#        batch-split-pdf --help
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/batch_split_legal_docs.py" "$@"
