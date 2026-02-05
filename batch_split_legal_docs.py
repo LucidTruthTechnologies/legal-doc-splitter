@@ -72,19 +72,19 @@ def process_directory(directory: Path, output_dir: Path = None,
     }
 
     for pdf_file in sorted(pdf_files):
-        print(f"\n{pdf_file.name}: ", end="", flush=True)
+        print(f"\nProcessing: {pdf_file.name}")
 
         try:
             # Analyze PDF
             documents = analyze_pdf(pdf_file)
 
             if not documents:
-                print("single document")
+                print("  → single document (no split needed)")
                 stats['single'] += 1
                 continue
 
             # Multiple documents detected
-            print(f"{len(documents)} documents")
+            print(f"  → {len(documents)} documents detected")
 
             # Determine output directory
             out_dir = output_dir if output_dir else pdf_file.parent

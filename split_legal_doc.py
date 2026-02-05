@@ -377,7 +377,7 @@ For more information, see README.md
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Analyze PDF
-    print(f"{args.pdf_file.name}: ", end="", flush=True)
+    print(f"Processing: {args.pdf_file.name}")
 
     documents = analyze_pdf(args.pdf_file, debug=args.debug)
 
