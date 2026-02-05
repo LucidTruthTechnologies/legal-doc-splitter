@@ -110,6 +110,14 @@ CHECKPOINT_INTERVAL = 50
 # DATA STRUCTURES
 # ============================================================================
 
+class BoundaryInfo(NamedTuple):
+    """Information about how a document boundary was detected."""
+    method: str           # "page_x_of_y", "standalone_reset", "header_change", "end_of_file"
+    page_num: int         # PDF page number (0-indexed) where boundary was detected
+    matched_text: str     # The text snippet that triggered the detection
+    details: str          # Additional details (e.g., "Page 5 of 5" or "AFFIDAVIT → WARRANT")
+
+
 class DocumentInfo(NamedTuple):
     """Information about a detected document segment."""
     start_page: int
@@ -117,6 +125,7 @@ class DocumentInfo(NamedTuple):
     title: str
     has_no_ocr_pages: bool
     no_ocr_page_count: int
+    boundary_info: Optional[BoundaryInfo] = None  # How this document's end was detected
 
 
 # ============================================================================
@@ -160,37 +169,141 @@ def delete_checkpoint(checkpoint_path: Path) -> None:
 
 def documents_to_list(documents: List[DocumentInfo]) -> List[Dict]:
     """Convert DocumentInfo list to JSON-serializable list."""
-    return [
-        {
+    result = []
+    for d in documents:
+        doc_dict = {
             'start_page': d.start_page,
             'end_page': d.end_page,
             'title': d.title,
             'has_no_ocr_pages': d.has_no_ocr_pages,
             'no_ocr_page_count': d.no_ocr_page_count
         }
-        for d in documents
-    ]
+        if d.boundary_info:
+            doc_dict['boundary_info'] = {
+                'method': d.boundary_info.method,
+                'page_num': d.boundary_info.page_num,
+                'matched_text': d.boundary_info.matched_text,
+                'details': d.boundary_info.details
+            }
+        result.append(doc_dict)
+    return result
 
 
 def list_to_documents(data: List[Dict]) -> List[DocumentInfo]:
     """Convert JSON list back to DocumentInfo list."""
-    return [
-        DocumentInfo(
+    result = []
+    for d in data:
+        boundary_info = None
+        if 'boundary_info' in d and d['boundary_info']:
+            bi = d['boundary_info']
+            boundary_info = BoundaryInfo(
+                method=bi['method'],
+                page_num=bi['page_num'],
+                matched_text=bi['matched_text'],
+                details=bi['details']
+            )
+        result.append(DocumentInfo(
             start_page=d['start_page'],
             end_page=d['end_page'],
             title=d['title'],
             has_no_ocr_pages=d['has_no_ocr_pages'],
-            no_ocr_page_count=d['no_ocr_page_count']
-        )
-        for d in data
-    ]
+            no_ocr_page_count=d['no_ocr_page_count'],
+            boundary_info=boundary_info
+        ))
+    return result
+
+
+def write_split_log(pdf_path: Path, documents: List[DocumentInfo],
+                    output_files: List[Path], output_dir: Path) -> Path:
+    """
+    Write a detailed log of the splitting decisions.
+
+    Args:
+        pdf_path: Original PDF file path
+        documents: List of detected documents with boundary info
+        output_files: List of output file paths
+        output_dir: Output directory
+
+    Returns:
+        Path to the log file
+    """
+    log_path = output_dir / f"{pdf_path.stem}_split_log.md"
+
+    with open(log_path, 'w') as f:
+        f.write(f"# Split Log: {pdf_path.name}\n\n")
+        f.write(f"**Source:** `{pdf_path}`\n")
+        f.write(f"**Documents detected:** {len(documents)}\n")
+        f.write(f"**Generated:** {Path(__file__).name}\n\n")
+        f.write("---\n\n")
+
+        # Track per-type counters for filename explanation
+        type_counters: dict[str, int] = {}
+
+        for idx, doc in enumerate(documents):
+            num_pages = doc.end_page - doc.start_page + 1
+
+            # Calculate the filename that was generated
+            doc_type_clean = clean_filename(doc.title)
+            type_counters[doc_type_clean] = type_counters.get(doc_type_clean, 0) + 1
+            type_count = type_counters[doc_type_clean]
+            prefix = "No_OCR_" if doc.has_no_ocr_pages else ""
+            filename = f"{prefix}{doc_type_clean}_{type_count:03d}.pdf"
+
+            f.write(f"## Document {idx + 1}: `{filename}`\n\n")
+
+            # Page range
+            f.write(f"**Pages:** {doc.start_page + 1} - {doc.end_page + 1} ({num_pages} pages)\n\n")
+
+            # Boundary detection info
+            f.write("### Boundary Detection\n\n")
+            if doc.boundary_info:
+                bi = doc.boundary_info
+                method_names = {
+                    'page_x_of_y': 'Page X of Y Pattern',
+                    'standalone_reset': 'Standalone Page Number Reset',
+                    'header_change': 'Header Document Type Change',
+                    'end_of_file': 'End of PDF File'
+                }
+                f.write(f"**Method:** {method_names.get(bi.method, bi.method)}\n\n")
+                f.write(f"**Detection page:** {bi.page_num + 1}\n\n")
+                f.write(f"**Details:** {bi.details}\n\n")
+                f.write(f"**Matched text:**\n```\n{bi.matched_text}\n```\n\n")
+            else:
+                f.write("*No boundary info recorded*\n\n")
+
+            # Filename determination
+            f.write("### Filename Determination\n\n")
+            f.write(f"**Document title detected:** {doc.title}\n\n")
+
+            # Explain type extraction
+            title_lower = doc.title.lower() if doc.title else ""
+            matched_keyword = None
+            for keyword, clean_name in DOCUMENT_TYPES.items():
+                if keyword in title_lower:
+                    matched_keyword = keyword
+                    break
+
+            if matched_keyword:
+                f.write(f"**Keyword matched:** \"{matched_keyword}\" → `{doc_type_clean}`\n\n")
+            else:
+                f.write(f"**No keyword matched:** defaulting to `{doc_type_clean}`\n\n")
+
+            f.write(f"**Per-type counter:** This is {doc_type_clean} #{type_count}\n\n")
+
+            if doc.has_no_ocr_pages:
+                f.write(f"**No-OCR prefix:** Added because {doc.no_ocr_page_count} page(s) had insufficient text\n\n")
+
+            f.write(f"**Final filename:** `{filename}`\n\n")
+            f.write("---\n\n")
+
+    return log_path
 
 
 # ============================================================================
 # CORE FUNCTIONS
 # ============================================================================
 
-def extract_page_of_info(text: str, debug: bool = False) -> Tuple[Optional[int], Optional[int]]:
+def extract_page_of_info(text: str, debug: bool = False) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     """
     Extract "Page X of Y" numbering from page text.
 
@@ -199,7 +312,7 @@ def extract_page_of_info(text: str, debug: bool = False) -> Tuple[Optional[int],
         debug: If True, print debug information
 
     Returns:
-        Tuple of (current_page, total_pages) or (None, None) if not found
+        Tuple of (current_page, total_pages, matched_text) or (None, None, None) if not found
     """
     # Search first 2000 characters and last 500 (header/footer areas)
     search_text = text[:2000] + "\n" + text[-500:] if len(text) > 2500 else text
@@ -210,14 +323,15 @@ def extract_page_of_info(text: str, debug: bool = False) -> Tuple[Optional[int],
         if match:
             current_page = int(match.group(1))
             total_pages = int(match.group(2))
+            matched_text = match.group(0).strip()
             if debug:
                 print(f"    Found: Page {current_page} of {total_pages}")
-            return (current_page, total_pages)
+            return (current_page, total_pages, matched_text)
 
-    return (None, None)
+    return (None, None, None)
 
 
-def extract_standalone_page(text: str, debug: bool = False) -> Optional[int]:
+def extract_standalone_page(text: str, debug: bool = False) -> Tuple[Optional[int], Optional[str]]:
     """
     Extract standalone page number (without "of Y") from page text.
 
@@ -226,7 +340,7 @@ def extract_standalone_page(text: str, debug: bool = False) -> Optional[int]:
         debug: If True, print debug information
 
     Returns:
-        Page number if found, None otherwise
+        Tuple of (page_number, matched_text) or (None, None) if not found
     """
     # Search header and footer areas
     search_text = text[:1000] + "\n" + text[-500:] if len(text) > 1500 else text
@@ -237,14 +351,15 @@ def extract_standalone_page(text: str, debug: bool = False) -> Optional[int]:
             page_num = int(match.group(1))
             # Sanity check - page numbers are usually reasonable
             if 1 <= page_num <= 9999:
+                matched_text = match.group(0).strip()
                 if debug:
                     print(f"    Found standalone: Page {page_num}")
-                return page_num
+                return (page_num, matched_text)
 
-    return None
+    return (None, None)
 
 
-def extract_header_doc_type(text: str, debug: bool = False) -> Optional[str]:
+def extract_header_doc_type(text: str, debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
     """
     Extract document type from page header.
 
@@ -256,17 +371,23 @@ def extract_header_doc_type(text: str, debug: bool = False) -> Optional[str]:
         debug: If True, print debug information
 
     Returns:
-        Document type string if found, None otherwise
+        Tuple of (doc_type, header_snippet) or (None, None) if not found
     """
-    header_text = text[:500].upper()
+    header_text = text[:500]
+    header_upper = header_text.upper()
 
     for doc_type in HEADER_DOC_TYPES:
-        if doc_type in header_text:
+        if doc_type in header_upper:
+            # Extract a snippet around the match
+            idx = header_upper.find(doc_type)
+            start = max(0, idx - 20)
+            end = min(len(header_text), idx + len(doc_type) + 20)
+            snippet = header_text[start:end].replace('\n', ' ').strip()
             if debug:
                 print(f"    Header type: {doc_type}")
-            return doc_type
+            return (doc_type, snippet)
 
-    return None
+    return (None, None)
 
 
 def extract_document_title(text: str) -> Optional[str]:
@@ -420,18 +541,25 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                             print(f"\n    Page {page_num + 1}: No OCR text detected")
 
                     # === METHOD 1: "Page X of Y" detection ===
-                    current_page, page_total = extract_page_of_info(text, debug)
+                    current_page, page_total, page_matched_text = extract_page_of_info(text, debug)
 
                     if current_page and page_total:
                         # Check if this is the last page of a document
                         if current_page == page_total:
                             doc_title = extract_document_title(text) or current_title or "Unknown"
+                            boundary = BoundaryInfo(
+                                method="page_x_of_y",
+                                page_num=page_num,
+                                matched_text=page_matched_text or "",
+                                details=f"Page {current_page} of {page_total}"
+                            )
                             documents.append(DocumentInfo(
                                 start_page=current_start,
                                 end_page=page_num,
                                 title=doc_title,
                                 has_no_ocr_pages=current_no_ocr_count > 0,
-                                no_ocr_page_count=current_no_ocr_count
+                                no_ocr_page_count=current_no_ocr_count,
+                                boundary_info=boundary
                             ))
 
                             if debug:
@@ -455,7 +583,7 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                         continue  # Skip other detection methods if Page X of Y found
 
                     # === METHOD 2: Standalone page number reset detection ===
-                    standalone_page = extract_standalone_page(text, debug)
+                    standalone_page, standalone_matched = extract_standalone_page(text, debug)
 
                     if standalone_page is not None:
                         # Boundary if page resets to 1 (and we had a previous page > 1)
@@ -463,12 +591,19 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                             # The PREVIOUS page was the end of a document
                             if page_num > current_start:  # Ensure we have pages to split
                                 doc_title = current_title or "Unknown"
+                                boundary = BoundaryInfo(
+                                    method="standalone_reset",
+                                    page_num=page_num - 1,  # Boundary at previous page
+                                    matched_text=standalone_matched or "",
+                                    details=f"Page number reset: {prev_standalone_page} → 1"
+                                )
                                 documents.append(DocumentInfo(
                                     start_page=current_start,
                                     end_page=page_num - 1,
                                     title=doc_title,
                                     has_no_ocr_pages=current_no_ocr_count > 0,
-                                    no_ocr_page_count=current_no_ocr_count
+                                    no_ocr_page_count=current_no_ocr_count,
+                                    boundary_info=boundary
                                 ))
 
                                 if debug:
@@ -484,7 +619,7 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                         prev_standalone_page = standalone_page
 
                     # === METHOD 3: Header document type change detection ===
-                    header_type = extract_header_doc_type(text, debug)
+                    header_type, header_snippet = extract_header_doc_type(text, debug)
 
                     if header_type:
                         # Boundary if document type changed
@@ -492,12 +627,19 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                             # The PREVIOUS page was the end of a document
                             if page_num > current_start:
                                 doc_title = current_title or prev_header_type or "Unknown"
+                                boundary = BoundaryInfo(
+                                    method="header_change",
+                                    page_num=page_num - 1,  # Boundary at previous page
+                                    matched_text=header_snippet or "",
+                                    details=f"Header type changed: {prev_header_type} → {header_type}"
+                                )
                                 documents.append(DocumentInfo(
                                     start_page=current_start,
                                     end_page=page_num - 1,
                                     title=doc_title,
                                     has_no_ocr_pages=current_no_ocr_count > 0,
-                                    no_ocr_page_count=current_no_ocr_count
+                                    no_ocr_page_count=current_no_ocr_count,
+                                    boundary_info=boundary
                                 ))
 
                                 if debug:
@@ -533,12 +675,19 @@ def analyze_pdf(pdf_path: Path, output_dir: Path = None, debug: bool = False,
                         print("No document boundaries detected")
                     return None
                 else:
+                    boundary = BoundaryInfo(
+                        method="end_of_file",
+                        page_num=total_pdf_pages - 1,
+                        matched_text="[End of PDF file]",
+                        details=f"Reached end of PDF at page {total_pdf_pages}"
+                    )
                     documents.append(DocumentInfo(
                         start_page=current_start,
                         end_page=total_pdf_pages - 1,
                         title=current_title or "Unknown",
                         has_no_ocr_pages=current_no_ocr_count > 0,
-                        no_ocr_page_count=current_no_ocr_count
+                        no_ocr_page_count=current_no_ocr_count,
+                        boundary_info=boundary
                     ))
 
                     if debug:
@@ -683,6 +832,14 @@ def split_pdf(pdf_path: Path, documents: List[DocumentInfo],
                 print(f"\nDeleted original: {pdf_path.name}")
         except Exception as e:
             print(f"Warning: Could not delete original file: {e}", file=sys.stderr)
+
+    # Generate split log
+    if output_files:
+        try:
+            log_path = write_split_log(pdf_path, documents, output_files, output_dir)
+            print(f"  → Split log: {log_path.name}")
+        except Exception as e:
+            print(f"Warning: Could not write split log: {e}", file=sys.stderr)
 
     return output_files
 
